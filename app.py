@@ -17,8 +17,8 @@ st.set_page_config(
 )
 
 st.title("🗓️ 生產排程反推看板")
-st.caption("自動辨識 Excel 工作表、標題列與欄位，依組立地點及客戶入庫日反推生產排程。")
-st.success("目前程式版本：2026-06-30-v4｜客戶入庫日反推開工日")
+st.caption("自動辨識 Excel 工作表、標題列與欄位，依客戶入庫日、組立地點緩衝與 Category 標準工期反推預計入庫日及預計發料日。")
+st.success("目前程式版本：2026-06-30-v5｜客戶入庫日反推發料日與入庫日")
 
 
 # =========================================================
@@ -400,10 +400,10 @@ else:
     result["數量_計算"] = 1
 
 # 排程反推公式：
-# 預計完成日 = 客戶入庫日 - 組立地點緩衝工作日
-# 預計開工日 = 預計完成日 - 標準工期
+# 預計入庫日 = 客戶入庫日 - 組立地點緩衝工作日
+# 預計發料日 = 預計入庫日 - Category 標準工期
 # 以上均以工作日計算，排除週六、週日及自訂假日。
-result["預計完成日"] = result.apply(
+result["預計入庫日"] = result.apply(
     lambda row: workday_offset(
         row[customer_date_col],
         -int(row["地點緩衝工作日"]),
@@ -412,9 +412,9 @@ result["預計完成日"] = result.apply(
     axis=1,
 )
 
-result["預計開工日"] = result.apply(
+result["預計發料日"] = result.apply(
     lambda row: workday_offset(
-        row["預計完成日"],
+        row["預計入庫日"],
         -int(row["標準工期_計算"]),
         holidays,
     ),
@@ -430,36 +430,47 @@ today = pd.Timestamp(date.today())
 result["排程狀態"] = np.select(
     [
         result[customer_date_col].isna(),
-        result["預計完成日"] < today,
-        result["預計開工日"] <= today,
+        result["預計入庫日"] < today,
+        result["預計發料日"] <= today,
     ],
     [
         "缺少客戶入庫日",
-        "已逾預計完成日",
+        "已逾預計入庫日",
         "應進行中",
     ],
     default="未開始",
 )
 
 
+
+# 若原始 Excel 已有「發料日／預計發料日」或「入庫日／預計入庫日」欄位，
+# 直接以本次反推結果更新，避免匯出後原欄位仍為空白。
+for target_name in ["發料日", "預計發料日"]:
+    if target_name in result.columns:
+        result[target_name] = result["預計發料日"]
+
+for target_name in ["入庫日", "預計入庫日"]:
+    if target_name in result.columns and target_name != customer_date_col:
+        result[target_name] = result["預計入庫日"]
+
 # =========================================================
 # 看板
 # =========================================================
 st.divider()
 st.info(
-    "反推公式：預計開工日 ＝ 客戶入庫日 − 組立地點緩衝工作日 − Category 標準工期"
+    "反推公式：預計入庫日 ＝ 客戶入庫日 − 組立地點緩衝工作日；預計發料日 ＝ 預計入庫日 − Category 標準工期"
 )
 st.subheader("排程摘要")
 
 total_rows = len(result)
 valid_dates = int(result[customer_date_col].notna().sum())
-overdue = int((result["排程狀態"] == "已逾預計完成日").sum())
+overdue = int((result["排程狀態"] == "已逾預計入庫日").sum())
 in_progress = int((result["排程狀態"] == "應進行中").sum())
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("總筆數", f"{total_rows:,}")
 k2.metric("有效入庫日", f"{valid_dates:,}")
-k3.metric("已逾預計完成日", f"{overdue:,}")
+k3.metric("已逾預計入庫日", f"{overdue:,}")
 k4.metric("應進行中", f"{in_progress:,}")
 
 display_cols = [
@@ -472,8 +483,8 @@ display_cols = [
         "標準工期_計算",
         "地點緩衝工作日",
         "反推總工作日",
-        "預計開工日",
-        "預計完成日",
+        "預計發料日",
+        "預計入庫日",
         "排程狀態",
     ]
     if col is not None and col in result.columns
@@ -491,9 +502,9 @@ location_summary = (
     result.groupby(location_col, dropna=False)
     .agg(
         筆數=(location_col, "size"),
-        最早開工日=("預計開工日", "min"),
-        最晚完成日=("預計完成日", "max"),
-        已逾期=("排程狀態", lambda values: int((values == "已逾預計完成日").sum())),
+        最早發料日=("預計發料日", "min"),
+        最晚入庫日=("預計入庫日", "max"),
+        已逾期=("排程狀態", lambda values: int((values == "已逾預計入庫日").sum())),
     )
     .reset_index()
 )
