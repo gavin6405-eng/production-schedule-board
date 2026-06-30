@@ -172,7 +172,7 @@ if "標準工期" not in df.columns:
 df["地點緩衝工作日"] = (
     df["組立地點"].astype(str).str.strip()
       .map(location_buffer)
-      .fillna(location_buffer["其他"])
+      .fillna(location_buffer["fillna(0)"])
       .astype(int)
 )
 
