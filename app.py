@@ -194,12 +194,28 @@ unknown_location_buffer = st.sidebar.number_input(
 
 st.sidebar.subheader("Category 標準工期")
 default_category_days: Dict[str, int] = {
-    "自製模組": st.sidebar.number_input("自製模組", min_value=0, value=15, step=1),
-    "機構": st.sidebar.number_input("機構", min_value=0, value=10, step=1),
-    "管路": st.sidebar.number_input("管路", min_value=0, value=10, step=1),
-    "電控": st.sidebar.number_input("電控", min_value=0, value=10, step=1),
-    "其他": st.sidebar.number_input("其他 Category", min_value=0, value=10, step=1),
-}
+ st.sidebar.subheader("Category 標準工期")
+
+default_category_days: Dict[str, int] = {
+    "EFEM": st.sidebar.number_input(
+        "EFEM", min_value=0, value=10, step=1
+    ),
+    "sort": st.sidebar.number_input(
+        "sort", min_value=0, value=10, step=1
+    ),
+    "骨包": st.sidebar.number_input(
+        "骨包", min_value=0, value=10, step=1
+    ),
+    "BWS": st.sidebar.number_input(
+        "BWS", min_value=0, value=10, step=1
+    ),
+    "NTB": st.sidebar.number_input(
+        "NTB", min_value=0, value=10, step=1
+    ),
+    "other": st.sidebar.number_input(
+        "other", min_value=0, value=10, step=1
+    ),
+
 
 st.sidebar.subheader("假日設定")
 holiday_text = st.sidebar.text_area(
@@ -378,7 +394,7 @@ if duration_col:
     result.loc[missing_duration, "標準工期_計算"] = (
         result.loc[missing_duration, category_col]
         .map(default_category_days)
-        .fillna(default_category_days["其他"])
+        .fillna(default_category_days["other"])
         .astype(int)
     )
 else:
