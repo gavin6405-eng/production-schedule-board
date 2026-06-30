@@ -26,7 +26,7 @@ COLUMN_ALIASES = {
     "標準工期": ["標準工期", "標準組裝工作日", "工期"],
 }
 
-DEFAULT_LOCATION_BUFFER = {"竹東": 2, "竹南": 5, "外包": 7, "其他": 3}
+DEFAULT_LOCATION_BUFFER = {"竹東": 5, "模冠": 3, "御弘": 3, "宏田": 3}
 DEFAULT_CATEGORY_DAYS = {"自製模組": 15, "Sorter": 25, "BWBS": 45, "PACKING PARTS COMP": 15, "其他": 20}
 
 def clean_text(v):
