@@ -1,449 +1,326 @@
 
 import io
-import re
-from datetime import datetime, date, timedelta
-
+from datetime import date
 import pandas as pd
-import plotly.express as px
+import numpy as np
 import streamlit as st
 
 st.set_page_config(
-    page_title="每日生產排程看板",
-    page_icon="🏭",
-    layout="wide"
+    page_title="生產排程反推看板",
+    page_icon="📅",
+    layout="wide",
 )
 
-FIXED_ALIASES = {
-    "製令": ["製令", "製令號", "工單", "工單號"],
+st.title("📅 生產排程反推看板")
+st.caption("依組立地點、標準工期、發料日、入庫日與客戶入庫日，自動反推並判定排程風險。")
+
+DEFAULT_LOCATION_BUFFER = {
+    "竹東": 2,
+    "竹南": 5,
+    "外包": 7,
+    "其他": 3,
+}
+
+DEFAULT_CATEGORY_DAYS = {
+    "自製模組": 15,
+    "Sorter": 25,
+    "BWBS": 45,
+    "PACKING PARTS COMP": 15,
+    "其他": 20,
+}
+
+COLUMN_ALIASES = {
+    "製令": ["製令", "工單", "MO", "Order"],
     "客戶": ["客戶", "Customer"],
     "P/N": ["P/N", "PN", "料號", "品號"],
-    "Type": ["Type", "機型", "品名"],
+    "Type": ["Type", "機型", "產品類型"],
     "Category": ["Category", "類別", "分類"],
     "組立地點": ["組立地點", "組裝地點", "地點"],
     "組立人員": ["組立人員", "組裝人員", "人員"],
     "組立進度": ["組立進度", "組裝進度", "進度"],
     "備註": ["備註", "Remark", "Remarks"],
-    "發料日": ["發料日", "領料日"],
-    "入庫日": ["入庫日", "公司入庫日"],
-    "客戶入庫日": ["客戶入庫日", "客戶需求日", "交期"]
+    "發料日": ["發料日", "Release Date"],
+    "入庫日": ["入庫日", "Warehouse Date"],
+    "客戶入庫日": ["客戶入庫日", "Customer Due Date", "客戶交期"],
+    "最晚到料日": ["最晚到料日", "到料日", "缺料到料日", "客供料到料日"],
+    "標準工期": ["標準工期", "標準組裝工作日", "工期"],
 }
 
-CODE_LABELS = {
-    "組": "組立",
-    "T": "測試",
-    "Q": "品質確認",
-    "R": "調整/重工",
-    "B": "包裝",
-    "W": "等待",
-    "出": "出貨/入庫",
-    "機": "機構",
-    "配": "配線",
-    "管": "管路",
-    "-": "無排程",
-    "": "無排程"
-}
-
-RISK_ORDER = ["逾期", "今日應完成", "7日內", "正常", "已完成"]
-STATUS_DONE_WORDS = ["已完成", "完成", "入庫", "出貨"]
-
-def clean_col_name(value):
-    if value is None:
-        return ""
-    return str(value).strip().replace("\n", "").replace(" ", "")
-
-def normalize_fixed_columns(df):
-    rename = {}
-    cleaned_map = {c: clean_col_name(c) for c in df.columns}
-    for target, aliases in FIXED_ALIASES.items():
-        alias_clean = [clean_col_name(x).lower() for x in aliases]
-        for original, cleaned in cleaned_map.items():
-            if cleaned.lower() in alias_clean:
-                rename[original] = target
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+    existing = {str(c).strip(): c for c in df.columns}
+    for target, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in existing:
+                rename_map[existing[alias]] = target
                 break
-    df = df.rename(columns=rename)
+    return df.rename(columns=rename_map)
 
-    required = ["製令", "客戶入庫日"]
-    missing = [x for x in required if x not in df.columns]
-    if missing:
-        raise ValueError("缺少必要欄位：" + "、".join(missing))
+def parse_date_series(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce")
 
-    for col in FIXED_ALIASES:
-        if col not in df.columns:
-            df[col] = ""
-    return df
+def business_day_offset(start, days, holidays):
+    if pd.isna(start):
+        return pd.NaT
+    start_np = np.datetime64(pd.Timestamp(start).date(), "D")
+    holiday_np = np.array(
+        [np.datetime64(pd.Timestamp(h).date(), "D") for h in holidays],
+        dtype="datetime64[D]"
+    )
+    result = np.busday_offset(
+        start_np,
+        int(days),
+        roll="backward" if int(days) < 0 else "forward",
+        holidays=holiday_np
+    )
+    return pd.Timestamp(result)
 
-def parse_date_header(col, default_year):
-    if isinstance(col, (pd.Timestamp, datetime, date)):
-        return pd.Timestamp(col).normalize()
+def business_days_between(start, end, holidays):
+    if pd.isna(start) or pd.isna(end):
+        return np.nan
+    s = np.datetime64(pd.Timestamp(start).date(), "D")
+    e = np.datetime64(pd.Timestamp(end).date(), "D")
+    holiday_np = np.array(
+        [np.datetime64(pd.Timestamp(h).date(), "D") for h in holidays],
+        dtype="datetime64[D]"
+    )
+    return int(np.busday_count(s, e, holidays=holiday_np))
 
-    text = str(col).strip()
-    text = text.replace("年", "/").replace("月", "/").replace("日", "")
-    text = re.sub(r"\s+", "", text)
-
-    patterns = [
-        (r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", True),
-        (r"^(\d{1,2})[/-](\d{1,2})$", False),
-        (r"^(\d{8})$", True),
-        (r"^(\d{4})$", False),
-    ]
-
-    for pattern, has_year in patterns:
-        m = re.match(pattern, text)
-        if not m:
-            continue
-        try:
-            if pattern == r"^(\d{8})$":
-                return pd.to_datetime(m.group(1), format="%Y%m%d").normalize()
-            if pattern == r"^(\d{4})$":
-                mmdd = m.group(1)
-                return pd.Timestamp(default_year, int(mmdd[:2]), int(mmdd[2:]))
-            if has_year:
-                return pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            return pd.Timestamp(default_year, int(m.group(1)), int(m.group(2)))
-        except Exception:
-            return None
-    return None
-
-def detect_timeline_columns(df):
-    years = []
-    for col in ["發料日", "入庫日", "客戶入庫日"]:
-        if col in df.columns:
-            vals = pd.to_datetime(df[col], errors="coerce").dropna()
-            years.extend(vals.dt.year.tolist())
-    default_year = int(pd.Series(years).mode().iloc[0]) if years else datetime.now().year
-
-    timeline = []
-    for col in df.columns:
-        if col in FIXED_ALIASES:
-            continue
-        dt = parse_date_header(col, default_year)
-        if dt is not None:
-            timeline.append((col, dt))
-
-    timeline.sort(key=lambda x: x[1])
-    return timeline
-
-def load_source(uploaded):
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded, encoding="utf-8-sig")
-    excel = pd.ExcelFile(uploaded)
-    selected_sheet = st.sidebar.selectbox("選擇工作表", excel.sheet_names)
-    return pd.read_excel(excel, sheet_name=selected_sheet)
-
-def status_done(row):
-    progress = str(row.get("組立進度", ""))
-    return any(word in progress for word in STATUS_DONE_WORDS)
-
-def calculate_risk(row):
-    due = row.get("客戶入庫日")
-    if pd.isna(due):
-        return "正常"
-    if status_done(row):
-        return "已完成"
-    today = pd.Timestamp.today().normalize()
-    due = pd.Timestamp(due).normalize()
-    days = (due - today).days
-    if days < 0:
-        return "逾期"
-    if days == 0:
-        return "今日應完成"
-    if days <= 7:
-        return "7日內"
-    return "正常"
-
-def prepare_data(df):
-    df = normalize_fixed_columns(df.copy())
-    for col in ["發料日", "入庫日", "客戶入庫日"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    df["風險"] = df.apply(calculate_risk, axis=1)
-    df["距客戶入庫日"] = (df["客戶入庫日"] - pd.Timestamp.today().normalize()).dt.days
-    return df
-
-def timeline_long(df, timeline_cols):
-    records = []
-    for idx, row in df.iterrows():
-        for original_col, schedule_date in timeline_cols:
-            value = row.get(original_col, "")
-            if pd.isna(value):
-                value = ""
-            code = str(value).strip()
-            if not code or code == "-":
-                continue
-            records.append({
-                "列號": idx,
-                "製令": row["製令"],
-                "客戶": row["客戶"],
-                "P/N": row["P/N"],
-                "Type": row["Type"],
-                "Category": row["Category"],
-                "組立地點": row["組立地點"],
-                "組立人員": row["組立人員"],
-                "組立進度": row["組立進度"],
-                "日期": schedule_date,
-                "代碼": code,
-                "作業": CODE_LABELS.get(code, code),
-                "風險": row["風險"]
-            })
-    return pd.DataFrame(records)
-
-def create_export(df, timeline_df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export_main = df.copy()
-        for c in ["發料日", "入庫日", "客戶入庫日"]:
-            export_main[c] = export_main[c].dt.strftime("%Y-%m-%d")
-        export_main.to_excel(writer, sheet_name="排程資料", index=False)
-        timeline_df.to_excel(writer, sheet_name="每日作業明細", index=False)
-        pd.DataFrame(
-            [{"代碼": k, "作業說明": v} for k, v in CODE_LABELS.items() if k]
-        ).to_excel(writer, sheet_name="代碼說明", index=False)
-    output.seek(0)
-    return output
-
-st.markdown("""
-<style>
-.block-container {padding-top: 0.8rem; padding-bottom: 2rem;}
-[data-testid="stMetric"] {
-    border: 1px solid #d9e2ec;
-    border-radius: 12px;
-    padding: 12px;
-    background: #ffffff;
-}
-[data-testid="stMetricValue"] {font-size: 1.9rem;}
-div[data-testid="stDataFrame"] {border: 1px solid #d9e2ec; border-radius: 10px;}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🏭 每日生產排程看板")
-st.caption("專用於「固定資料欄＋右側每日日期欄」格式，自動辨識組、T、Q、R、B、W、出等排程代碼。")
+def read_uploaded_file(uploaded_file):
+    suffix = uploaded_file.name.lower().split(".")[-1]
+    if suffix == "csv":
+        raw = uploaded_file.getvalue()
+        for enc in ("utf-8-sig", "cp950", "big5"):
+            try:
+                return pd.read_csv(io.BytesIO(raw), encoding=enc)
+            except Exception:
+                pass
+        raise ValueError("CSV 編碼無法辨識，請另存為 UTF-8 CSV 後再上傳。")
+    if suffix in ("xlsx", "xls"):
+        return pd.read_excel(uploaded_file)
+    raise ValueError("只支援 CSV、XLSX、XLS。")
 
 with st.sidebar:
-    st.header("📂 資料設定")
-    uploaded = st.file_uploader("上傳 Excel 或 CSV", type=["xlsx", "xls", "csv"])
-    st.markdown("---")
-    st.markdown("**必要欄位**")
-    st.code("製令、客戶入庫日")
-    st.markdown("**建議欄位**")
-    st.code("客戶、P/N、Type、Category、組立地點、組立進度、備註、發料日、入庫日")
-    st.markdown("**每日欄位範例**")
-    st.code("06/28、06/29、07/01\n或 2026/06/28")
+    st.header("⚙️ 排程參數")
 
-if uploaded is None:
-    st.info("請上傳原始排程表。ZIP 內附「排程範例.csv」可先測試。")
+    st.subheader("組立地點緩衝工作日")
+    location_buffer = {}
+    for k, v in DEFAULT_LOCATION_BUFFER.items():
+        location_buffer[k] = st.number_input(
+            f"{k}緩衝日",
+            min_value=0,
+            max_value=60,
+            value=v,
+            step=1,
+            key=f"loc_{k}"
+        )
+
+    st.subheader("Category標準工期")
+    category_days = {}
+    for k, v in DEFAULT_CATEGORY_DAYS.items():
+        category_days[k] = st.number_input(
+            f"{k}工期",
+            min_value=1,
+            max_value=180,
+            value=v,
+            step=1,
+            key=f"cat_{k}"
+        )
+
+    st.subheader("假日設定")
+    holiday_text = st.text_area(
+        "每行輸入一個日期（YYYY-MM-DD）",
+        placeholder="2026-01-01\n2026-02-16"
+    )
+    holidays = []
+    for line in holiday_text.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                holidays.append(pd.Timestamp(line))
+            except Exception:
+                st.warning(f"假日格式無法辨識：{line}")
+
+uploaded_file = st.file_uploader(
+    "上傳生產排程檔案",
+    type=["xlsx", "xls", "csv"],
+    help="需至少包含：組立地點、客戶入庫日；建議包含 Category、發料日、入庫日、最晚到料日。"
+)
+
+with st.expander("欄位需求與計算邏輯", expanded=False):
+    st.markdown("""
+**必要欄位**
+- 組立地點
+- 客戶入庫日
+
+**建議欄位**
+- 製令、客戶、P/N、Type、Category
+- 發料日、入庫日、最晚到料日、標準工期
+
+**計算方式**
+1. 建議入庫日 = 客戶入庫日 − 組立地點緩衝工作日  
+2. 建議發料日 = 建議入庫日 − 標準工期  
+3. 實際可開工日 = 建議發料日與最晚到料日取較晚者  
+4. 預估入庫日 = 實際可開工日 + 標準工期  
+5. 預估入庫日晚於建議入庫日，判定為「排程需變更」
+""")
+
+if uploaded_file is None:
+    st.info("請先上傳 Excel 或 CSV 排程檔案。")
     st.stop()
 
 try:
-    raw = load_source(uploaded)
-    data = prepare_data(raw)
-    timeline_cols = detect_timeline_columns(data)
-    daily = timeline_long(data, timeline_cols)
-except Exception as exc:
-    st.error(f"資料讀取失敗：{exc}")
+    df = normalize_columns(read_uploaded_file(uploaded_file))
+except Exception as e:
+    st.error(f"檔案讀取失敗：{e}")
     st.stop()
 
-if not timeline_cols:
-    st.warning("未找到右側每日日期欄。日期欄名稱請使用 06/28、2026/06/28 或 Excel 日期格式。")
+required = ["組立地點", "客戶入庫日"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error(f"缺少必要欄位：{', '.join(missing)}")
+    st.write("目前讀到的欄位：", list(df.columns))
+    st.stop()
 
-# 篩選器
-st.subheader("🔎 排程篩選")
-f1, f2, f3, f4, f5 = st.columns(5)
-customers = sorted([x for x in data["客戶"].dropna().astype(str).unique() if x])
-categories = sorted([x for x in data["Category"].dropna().astype(str).unique() if x])
-locations = sorted([x for x in data["組立地點"].dropna().astype(str).unique() if x])
-risks = [x for x in RISK_ORDER if x in data["風險"].unique()]
+for col in ["發料日", "入庫日", "客戶入庫日", "最晚到料日"]:
+    if col in df.columns:
+        df[col] = parse_date_series(df[col])
 
-sel_customer = f1.multiselect("客戶", customers)
-sel_category = f2.multiselect("Category", categories)
-sel_location = f3.multiselect("組立地點", locations)
-sel_risk = f4.multiselect("風險", risks)
-keyword = f5.text_input("搜尋製令 / P/N / Type")
+if "Category" not in df.columns:
+    df["Category"] = "其他"
+if "標準工期" not in df.columns:
+    df["標準工期"] = np.nan
+if "最晚到料日" not in df.columns:
+    df["最晚到料日"] = pd.NaT
 
-filtered = data.copy()
-if sel_customer:
-    filtered = filtered[filtered["客戶"].astype(str).isin(sel_customer)]
-if sel_category:
-    filtered = filtered[filtered["Category"].astype(str).isin(sel_category)]
-if sel_location:
-    filtered = filtered[filtered["組立地點"].astype(str).isin(sel_location)]
-if sel_risk:
-    filtered = filtered[filtered["風險"].isin(sel_risk)]
-if keyword:
-    key = keyword.lower()
-    mask = (
-        filtered["製令"].astype(str).str.lower().str.contains(key, na=False)
-        | filtered["P/N"].astype(str).str.lower().str.contains(key, na=False)
-        | filtered["Type"].astype(str).str.lower().str.contains(key, na=False)
-    )
-    filtered = filtered[mask]
+df["地點緩衝工作日"] = df["組立地點"].astype(str).map(location_buffer).fillna(location_buffer["其他"]).astype(int)
 
-filtered_daily = daily[daily["列號"].isin(filtered.index)] if not daily.empty else daily
+def get_standard_days(row):
+    manual = pd.to_numeric(row.get("標準工期"), errors="coerce")
+    if pd.notna(manual) and manual > 0:
+        return int(manual)
+    category = str(row.get("Category", "其他")).strip()
+    return int(category_days.get(category, category_days["其他"]))
 
-today = pd.Timestamp.today().normalize()
-today_jobs = filtered_daily[filtered_daily["日期"] == today] if not filtered_daily.empty else filtered_daily
-next7_jobs = filtered_daily[
-    (filtered_daily["日期"] >= today) &
-    (filtered_daily["日期"] <= today + pd.Timedelta(days=7))
-] if not filtered_daily.empty else filtered_daily
+df["標準組裝工作日"] = df.apply(get_standard_days, axis=1)
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("製令筆數", f"{len(filtered):,}")
-m2.metric("今日作業", f"{len(today_jobs):,}")
-m3.metric("未來7日作業", f"{len(next7_jobs):,}")
-m4.metric("逾期製令", f"{int((filtered['風險'] == '逾期').sum()):,}")
-m5.metric("7日內交期", f"{int(filtered['風險'].isin(['今日應完成','7日內']).sum()):,}")
+df["建議入庫日"] = df.apply(
+    lambda r: business_day_offset(r["客戶入庫日"], -r["地點緩衝工作日"], holidays),
+    axis=1
+)
+df["建議發料日"] = df.apply(
+    lambda r: business_day_offset(r["建議入庫日"], -r["標準組裝工作日"], holidays),
+    axis=1
+)
 
-tabs = st.tabs(["📊 管理看板", "📅 每日排程", "📋 製令總表", "🚨 異常追蹤", "📖 代碼說明"])
+def calc_actual_start(row):
+    suggested = row["建議發料日"]
+    material = row["最晚到料日"]
+    if pd.isna(material):
+        return suggested
+    if pd.isna(suggested):
+        return material
+    return max(suggested, material)
 
-with tabs[0]:
-    c1, c2 = st.columns(2)
+df["實際可開工日"] = df.apply(calc_actual_start, axis=1)
+df["預估入庫日"] = df.apply(
+    lambda r: business_day_offset(r["實際可開工日"], r["標準組裝工作日"], holidays),
+    axis=1
+)
 
-    with c1:
-        risk_summary = (
-            filtered["風險"].value_counts()
-            .reindex(RISK_ORDER, fill_value=0)
-            .reset_index()
-        )
-        risk_summary.columns = ["風險", "製令數"]
-        fig = px.bar(
-            risk_summary,
-            x="風險",
-            y="製令數",
-            text_auto=True,
-            title="交期風險分布",
-            category_orders={"風險": RISK_ORDER}
-        )
-        st.plotly_chart(fig, use_container_width=True)
+df["入庫至客戶工作日"] = df.apply(
+    lambda r: business_days_between(r["入庫日"], r["客戶入庫日"], holidays)
+    if "入庫日" in df.columns else np.nan,
+    axis=1
+)
 
-    with c2:
-        category_summary = (
-            filtered.groupby("Category", dropna=False)
-            .size().reset_index(name="製令數")
-            .sort_values("製令數", ascending=False)
-        )
-        fig = px.pie(
-            category_summary,
-            names="Category",
-            values="製令數",
-            hole=0.45,
-            title="Category 製令占比"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+def judge(row):
+    if pd.isna(row["客戶入庫日"]) or pd.isna(row["建議入庫日"]):
+        return "資料不足"
+    if pd.notna(row["預估入庫日"]) and row["預估入庫日"] > row["建議入庫日"]:
+        return "排程需變更"
+    if "入庫日" in row and pd.notna(row.get("入庫日")):
+        gap = row.get("入庫至客戶工作日")
+        if pd.notna(gap):
+            if gap < 0:
+                return "已逾期"
+            if gap < row["地點緩衝工作日"]:
+                return "緩衝不足"
+    return "正常"
 
-    c3, c4 = st.columns(2)
-    with c3:
-        if filtered_daily.empty:
-            st.info("無每日作業資料。")
-        else:
-            daily_count = (
-                filtered_daily.groupby(["日期", "作業"])
-                .size().reset_index(name="作業數")
-            )
-            fig = px.bar(
-                daily_count,
-                x="日期",
-                y="作業數",
-                color="作業",
-                barmode="stack",
-                title="每日作業負荷"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+df["排程判定"] = df.apply(judge, axis=1)
 
-    with c4:
-        customer_summary = (
-            filtered.groupby("客戶", dropna=False)
-            .size().reset_index(name="製令數")
-            .sort_values("製令數", ascending=False)
-            .head(10)
-        )
-        fig = px.bar(
-            customer_summary,
-            x="製令數",
-            y="客戶",
-            orientation="h",
-            text_auto=True,
-            title="客戶製令 Top 10"
-        )
-        fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig, use_container_width=True)
+def reason(row):
+    if row["排程判定"] == "排程需變更":
+        if pd.notna(row["最晚到料日"]) and row["最晚到料日"] > row["建議發料日"]:
+            return "最晚到料日晚於建議發料日"
+        return "預估入庫日晚於建議入庫日"
+    if row["排程判定"] == "緩衝不足":
+        return "原入庫日至客戶入庫日的工作日不足"
+    if row["排程判定"] == "已逾期":
+        return "原入庫日晚於客戶入庫日"
+    if row["排程判定"] == "資料不足":
+        return "客戶入庫日或必要日期缺漏"
+    return ""
 
-with tabs[1]:
-    if filtered_daily.empty:
-        st.warning("沒有可顯示的每日排程代碼。")
-    else:
-        date_min = filtered_daily["日期"].min().date()
-        date_max = filtered_daily["日期"].max().date()
-        selected_dates = st.date_input(
-            "顯示日期範圍",
-            value=(max(date_min, date.today() - timedelta(days=7)), date_max),
-            min_value=date_min,
-            max_value=date_max
-        )
+df["異常原因"] = df.apply(reason, axis=1)
 
-        date_filtered = filtered_daily.copy()
-        if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
-            start, end = selected_dates
-            date_filtered = date_filtered[
-                (date_filtered["日期"].dt.date >= start) &
-                (date_filtered["日期"].dt.date <= end)
-            ]
+total = len(df)
+normal = int((df["排程判定"] == "正常").sum())
+change = int((df["排程判定"] == "排程需變更").sum())
+warning = int(df["排程判定"].isin(["緩衝不足", "已逾期", "資料不足"]).sum())
 
-        pivot = date_filtered.pivot_table(
-            index=["製令", "客戶", "P/N", "Type", "組立進度"],
-            columns="日期",
-            values="代碼",
-            aggfunc=lambda x: "/".join(dict.fromkeys(str(v) for v in x)),
-            fill_value=""
-        ).reset_index()
-        pivot.columns = [
-            c.strftime("%m/%d") if isinstance(c, pd.Timestamp) else c
-            for c in pivot.columns
-        ]
-        st.dataframe(pivot, use_container_width=True, hide_index=True, height=520)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("總筆數", total)
+c2.metric("正常", normal)
+c3.metric("排程需變更", change)
+c4.metric("其他異常", warning)
 
-        st.markdown("#### 每日作業明細")
-        detail = date_filtered[
-            ["日期", "代碼", "作業", "製令", "客戶", "P/N", "Type", "組立地點", "組立進度", "風險"]
-        ].sort_values(["日期", "製令"])
-        detail["日期"] = detail["日期"].dt.strftime("%Y-%m-%d")
-        st.dataframe(detail, use_container_width=True, hide_index=True)
+st.subheader("排程分析結果")
 
-with tabs[2]:
-    show_cols = [
-        "風險", "製令", "客戶", "P/N", "Type", "Category",
-        "組立地點", "組立人員", "組立進度", "備註",
-        "發料日", "入庫日", "客戶入庫日", "距客戶入庫日"
-    ]
-    display = filtered[show_cols].copy()
-    for col in ["發料日", "入庫日", "客戶入庫日"]:
-        display[col] = display[col].dt.strftime("%Y-%m-%d")
-    st.dataframe(display, use_container_width=True, hide_index=True, height=570)
+preferred_cols = [
+    "製令", "客戶", "P/N", "Type", "Category", "組立地點",
+    "組立進度", "備註", "發料日", "入庫日", "客戶入庫日",
+    "最晚到料日", "地點緩衝工作日", "標準組裝工作日",
+    "建議發料日", "建議入庫日", "實際可開工日",
+    "預估入庫日", "排程判定", "異常原因"
+]
+show_cols = [c for c in preferred_cols if c in df.columns]
 
-with tabs[3]:
-    abnormal = filtered[
-        filtered["風險"].isin(["逾期", "今日應完成", "7日內"])
-    ].copy().sort_values(["客戶入庫日", "製令"])
-    abnormal_cols = [
-        "風險", "製令", "客戶", "P/N", "Type", "Category",
-        "組立進度", "備註", "入庫日", "客戶入庫日", "距客戶入庫日"
-    ]
-    for col in ["入庫日", "客戶入庫日"]:
-        abnormal[col] = abnormal[col].dt.strftime("%Y-%m-%d")
-    st.dataframe(abnormal[abnormal_cols], use_container_width=True, hide_index=True)
+def highlight_status(row):
+    status = row.get("排程判定", "")
+    if status == "正常":
+        return ["background-color: #d9ead3"] * len(row)
+    if status in ("緩衝不足", "資料不足"):
+        return ["background-color: #fff2cc"] * len(row)
+    if status in ("排程需變更", "已逾期"):
+        return ["background-color: #f4cccc"] * len(row)
+    return [""] * len(row)
 
-with tabs[4]:
-    explanation = pd.DataFrame(
-        [{"排程代碼": code, "作業說明": label} for code, label in CODE_LABELS.items() if code]
-    )
-    st.dataframe(explanation, use_container_width=True, hide_index=True)
-    st.info("若公司有其他代碼，可在 app.py 的 CODE_LABELS 內自行增加。")
+st.dataframe(
+    df[show_cols].style.apply(highlight_status, axis=1),
+    use_container_width=True,
+    hide_index=True,
+    height=520
+)
 
-st.divider()
-export_bytes = create_export(filtered, filtered_daily)
+st.subheader("依組立地點統計")
+location_summary = (
+    df.groupby(["組立地點", "排程判定"], dropna=False)
+      .size()
+      .reset_index(name="筆數")
+)
+st.dataframe(location_summary, use_container_width=True, hide_index=True)
+
+output = io.BytesIO()
+with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name="排程分析結果")
+    location_summary.to_excel(writer, index=False, sheet_name="地點統計")
+output.seek(0)
+
 st.download_button(
-    "⬇️ 下載篩選後排程與每日明細",
-    data=export_bytes,
-    file_name=f"每日生產排程看板匯出_{datetime.now():%Y%m%d}.xlsx",
+    "⬇️ 下載排程分析 Excel",
+    data=output,
+    file_name="生產排程反推分析結果.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
-st.caption(f"已辨識每日日期欄：{len(timeline_cols)} 欄")
