@@ -18,7 +18,7 @@ st.set_page_config(
 
 st.title("🗓️ 生產排程反推看板")
 st.caption("自動辨識 Excel 工作表、標題列與欄位，依組立地點及客戶入庫日反推生產排程。")
-st.success("目前程式版本：2026-06-30-v3")
+st.success("目前程式版本：2026-06-30-v4｜客戶入庫日反推開工日")
 
 
 # =========================================================
@@ -399,6 +399,10 @@ if quantity_col:
 else:
     result["數量_計算"] = 1
 
+# 排程反推公式：
+# 預計完成日 = 客戶入庫日 - 組立地點緩衝工作日
+# 預計開工日 = 預計完成日 - 標準工期
+# 以上均以工作日計算，排除週六、週日及自訂假日。
 result["預計完成日"] = result.apply(
     lambda row: workday_offset(
         row[customer_date_col],
@@ -416,6 +420,10 @@ result["預計開工日"] = result.apply(
     ),
     axis=1,
 )
+
+result["反推總工作日"] = (
+    result["地點緩衝工作日"] + result["標準工期_計算"]
+).astype(int)
 
 today = pd.Timestamp(date.today())
 
@@ -438,6 +446,9 @@ result["排程狀態"] = np.select(
 # 看板
 # =========================================================
 st.divider()
+st.info(
+    "反推公式：預計開工日 ＝ 客戶入庫日 − 組立地點緩衝工作日 − Category 標準工期"
+)
 st.subheader("排程摘要")
 
 total_rows = len(result)
@@ -460,6 +471,7 @@ display_cols = [
         customer_date_col,
         "標準工期_計算",
         "地點緩衝工作日",
+        "反推總工作日",
         "預計開工日",
         "預計完成日",
         "排程狀態",
