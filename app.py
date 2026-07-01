@@ -7,9 +7,9 @@ import pandas as pd
 import streamlit as st
 
 
-# =========================================================
-# 頁面設定
-# =========================================================
+# -----------------------------
+# Page setup
+# -----------------------------
 st.set_page_config(
     page_title="生產排程反推看板",
     page_icon="🗓️",
@@ -17,14 +17,15 @@ st.set_page_config(
 )
 
 st.title("🗓️ 生產排程反推看板")
-st.caption("自動辨識 Excel 工作表、標題列與欄位，依客戶入庫日、組立地點緩衝與 Category 標準工期反推預計入庫日及預計發料日。")
-st.success("目前程式版本：2026-06-30-v5｜客戶入庫日反推發料日與入庫日")
+st.success("目前程式版本：2026-07-01-v7｜標工完全依左側設定")
+st.caption("自動辨識 Excel 工作表、標題列及欄位，依組立地點與客戶入庫日反推生產排程。")
 
 
-# =========================================================
-# 共用函式
-# =========================================================
+# -----------------------------
+# Helpers
+# -----------------------------
 def clean_text(value) -> str:
+    """Normalize text for matching."""
     if pd.isna(value):
         return ""
     return (
@@ -41,43 +42,14 @@ def normalize_column_name(value) -> str:
     return clean_text(value).replace(" ", "")
 
 
-def deduplicate_columns(columns: List[str]) -> List[str]:
-    result: List[str] = []
-    counts: Dict[str, int] = {}
-
-    for col in columns:
-        base = normalize_column_name(col) or "未命名欄位"
-        counts[base] = counts.get(base, 0) + 1
-        result.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
-
-    return result
-
-
-def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
-    normalized_map = {normalize_column_name(col): col for col in columns}
-
-    for candidate in candidates:
-        key = normalize_column_name(candidate)
-        if key in normalized_map:
-            return normalized_map[key]
-
-    for col in columns:
-        normalized_col = normalize_column_name(col)
-        for candidate in candidates:
-            normalized_candidate = normalize_column_name(candidate)
-            if normalized_candidate and (
-                normalized_candidate in normalized_col
-                or normalized_col in normalized_candidate
-            ):
-                return col
-
-    return None
-
-
 def find_best_sheet_and_header(
     excel_bytes: bytes,
-    max_scan_rows: int = 50,
-) -> Tuple[str, int]:
+    max_scan_rows: int = 40,
+) -> Tuple[str, int, pd.DataFrame]:
+    """
+    Find the sheet/header row with the highest keyword score.
+    Returns: sheet_name, zero-based header row, preview dataframe.
+    """
     keywords = [
         "製令",
         "製令號",
@@ -86,22 +58,24 @@ def find_best_sheet_and_header(
         "入庫日",
         "組立地點",
         "組裝地點",
+        "組立場所",
         "Category",
+        "類別",
         "機型",
-        "標準工期",
         "數量",
     ]
 
     xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+    best_score = -1
     best_sheet = xls.sheet_names[0]
     best_header = 0
-    best_score = -1.0
+    best_preview = pd.DataFrame()
 
-    for sheet_name in xls.sheet_names:
+    for sheet in xls.sheet_names:
         try:
             preview = pd.read_excel(
                 io.BytesIO(excel_bytes),
-                sheet_name=sheet_name,
+                sheet_name=sheet,
                 header=None,
                 nrows=max_scan_rows,
                 dtype=object,
@@ -109,27 +83,77 @@ def find_best_sheet_and_header(
         except Exception:
             continue
 
-        for row_index, row in preview.iterrows():
+        for idx, row in preview.iterrows():
             values = [normalize_column_name(v) for v in row.tolist()]
-            row_text = "|".join(values)
-            keyword_score = sum(
-                1 for keyword in keywords
-                if normalize_column_name(keyword) in row_text
-            )
-            non_empty_count = sum(bool(value) for value in values)
-            score = keyword_score + (0.2 if non_empty_count >= 3 else 0)
+            joined = "|".join(values)
+            score = sum(1 for kw in keywords if normalize_column_name(kw) in joined)
+
+            # Favor rows with several non-empty cells.
+            non_empty = sum(bool(v) for v in values)
+            if non_empty >= 3:
+                score += 0.25
 
             if score > best_score:
                 best_score = score
-                best_sheet = sheet_name
-                best_header = int(row_index)
+                best_sheet = sheet
+                best_header = int(idx)
+                best_preview = preview
 
-    return best_sheet, best_header
+    return best_sheet, best_header, best_preview
+
+
+def deduplicate_columns(columns: List[str]) -> List[str]:
+    result = []
+    counts: Dict[str, int] = {}
+    for col in columns:
+        base = normalize_column_name(col) or "未命名欄位"
+        counts[base] = counts.get(base, 0) + 1
+        result.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
+    return result
+
+
+def find_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    normalized = {normalize_column_name(c): c for c in columns}
+
+    # Exact match first
+    for candidate in candidates:
+        key = normalize_column_name(candidate)
+        if key in normalized:
+            return normalized[key]
+
+    # Partial match second
+    for col in columns:
+        ncol = normalize_column_name(col)
+        for candidate in candidates:
+            ncandidate = normalize_column_name(candidate)
+            if ncandidate and (ncandidate in ncol or ncol in ncandidate):
+                return col
+    return None
+
+
+
+def normalize_model(value) -> str:
+    """將 Excel 的機型寫法統一成左側 Category 名稱。"""
+    text = clean_text(value)
+    key = text.lower().replace(" ", "")
+
+    alias_map = {
+        "efem": "EFEM",
+        "sort": "sort",
+        "sorter": "sort",
+        "sorting": "sort",
+        "骨包": "骨包",
+        "bws": "BWS",
+        "bwbs": "BWS",
+        "ntb": "NTB",
+        "other": "other",
+        "其他": "other",
+    }
+    return alias_map.get(key, "other")
 
 
 def parse_holidays(text: str) -> List[pd.Timestamp]:
     holidays: List[pd.Timestamp] = []
-
     for raw in text.replace("，", ",").replace("\n", ",").split(","):
         raw = raw.strip()
         if not raw:
@@ -138,7 +162,6 @@ def parse_holidays(text: str) -> List[pd.Timestamp]:
             holidays.append(pd.Timestamp(raw).normalize())
         except Exception:
             pass
-
     return holidays
 
 
@@ -147,44 +170,32 @@ def workday_offset(
     offset_days: int,
     holidays: List[pd.Timestamp],
 ) -> pd.Timestamp:
+    """
+    Offset by business days. Negative means reverse scheduling.
+    """
     if pd.isna(start_date):
         return pd.NaT
 
-    current = pd.Timestamp(start_date).normalize()
-    holiday_dates = {holiday.date() for holiday in holidays}
-    offset_days = int(offset_days)
+    ts = pd.Timestamp(start_date).normalize()
+    holiday_dates = {h.date() for h in holidays}
     step = 1 if offset_days >= 0 else -1
-    remaining = abs(offset_days)
+    remaining = abs(int(offset_days))
 
     while remaining > 0:
-        current += pd.Timedelta(days=step)
-        if current.weekday() < 5 and current.date() not in holiday_dates:
+        ts += pd.Timedelta(days=step)
+        if ts.weekday() < 5 and ts.date() not in holiday_dates:
             remaining -= 1
 
-    return current
+    return ts
 
 
 def safe_numeric(series: pd.Series, default: float = 0) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(default)
 
 
-def normalize_model(value: str) -> str:
-    text = clean_text(value)
-    alias_map = {
-        "efem": "EFEM",
-        "sort": "sort",
-        "骨包": "骨包",
-        "bws": "BWS",
-        "ntb": "NTB",
-        "other": "other",
-        "其他": "other",
-    }
-    return alias_map.get(text.lower(), text)
-
-
-# =========================================================
-# 左側參數
-# =========================================================
+# -----------------------------
+# Sidebar parameters
+# -----------------------------
 st.sidebar.header("⚙️ 排程參數")
 
 st.sidebar.subheader("組立地點緩衝工作日")
@@ -200,15 +211,16 @@ unknown_location_buffer = st.sidebar.number_input(
     min_value=0,
     value=0,
     step=1,
+    help="Excel 中出現其他地點或空白時使用，避免 KeyError。",
 )
 
 st.sidebar.subheader("Category 標準工期")
 default_category_days: Dict[str, int] = {
-    "EFEM": st.sidebar.number_input("EFEM", min_value=0, value=10, step=1),
-    "sort": st.sidebar.number_input("sort", min_value=0, value=10, step=1),
-    "骨包": st.sidebar.number_input("骨包", min_value=0, value=10, step=1),
-    "BWS": st.sidebar.number_input("BWS", min_value=0, value=10, step=1),
-    "NTB": st.sidebar.number_input("NTB", min_value=0, value=10, step=1),
+    "EFEM": st.sidebar.number_input("EFEM", min_value=0, value=15, step=1),
+    "sort": st.sidebar.number_input("sort", min_value=0, value=15, step=1),
+    "骨包": st.sidebar.number_input("骨包", min_value=0, value=15, step=1),
+    "BWS": st.sidebar.number_input("BWS", min_value=0, value=21, step=1),
+    "NTB": st.sidebar.number_input("NTB", min_value=0, value=15, step=1),
     "other": st.sidebar.number_input("other", min_value=0, value=10, step=1),
 }
 
@@ -216,19 +228,17 @@ st.sidebar.subheader("假日設定")
 holiday_text = st.sidebar.text_area(
     "額外排除日期",
     placeholder="例如：2026-07-01, 2026-09-25",
+    help="週六、週日會自動排除；公司休假日請以逗號分隔。",
 )
 holidays = parse_holidays(holiday_text)
 
 
-# =========================================================
-# Excel 上傳區
-# =========================================================
-st.subheader("📤 上傳生產排程 Excel")
-
+# -----------------------------
+# File upload
+# -----------------------------
 uploaded_file = st.file_uploader(
-    "請選擇 Excel 檔案",
+    "上傳生產排程檔案",
     type=["xlsx", "xlsm", "xls"],
-    help="支援 XLSX、XLSM、XLS 格式",
 )
 
 if uploaded_file is None:
@@ -238,21 +248,24 @@ if uploaded_file is None:
 excel_bytes = uploaded_file.getvalue()
 
 try:
-    detected_sheet, detected_header = find_best_sheet_and_header(excel_bytes)
-    xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+    detected_sheet, detected_header, _ = find_best_sheet_and_header(excel_bytes)
 except Exception as exc:
     st.error(f"無法讀取 Excel：{exc}")
     st.stop()
 
-col1, col2 = st.columns(2)
+try:
+    xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+except Exception as exc:
+    st.error(f"Excel 格式無法解析：{exc}")
+    st.stop()
 
+col1, col2 = st.columns(2)
 with col1:
     selected_sheet = st.selectbox(
         "工作表",
         options=xls.sheet_names,
         index=xls.sheet_names.index(detected_sheet),
     )
-
 with col2:
     header_row_display = st.number_input(
         "標題列（Excel 列號）",
@@ -277,63 +290,65 @@ except Exception as exc:
 df.columns = deduplicate_columns(list(df.columns))
 df = df.dropna(how="all").copy()
 
-st.success(f"已辨識工作表：{selected_sheet}；標題列：第 {header_row + 1} 列")
+st.success(f"已讀取工作表：{selected_sheet}；標題列：第 {header_row + 1} 列")
 
 with st.expander("目前讀到的欄位", expanded=False):
     st.write(list(df.columns))
 
 
-# =========================================================
-# 欄位辨識
-# =========================================================
+# -----------------------------
+# Column detection
+# -----------------------------
 columns = list(df.columns)
 
-order_col_detected = find_column(
-    columns, ["製令", "製令號", "製造命令", "工單", "工單號", "MO"]
+order_col = find_column(
+    columns,
+    ["製令", "製令號", "製造命令", "工單", "工單號", "MO"],
 )
-location_col_detected = find_column(
-    columns, ["組立地點", "組裝地點", "組立場所", "組裝場所", "生產地點"]
+location_col = find_column(
+    columns,
+    ["組立地點", "組裝地點", "組立場所", "組裝場所", "生產地點"],
 )
-customer_date_col_detected = find_column(
-    columns, ["客戶入庫日", "客戶納入日", "客戶需求日", "入庫日", "交期", "出貨日"]
+customer_date_col = find_column(
+    columns,
+    ["客戶入庫日", "客戶納入日", "客戶需求日", "入庫日", "交期", "出貨日"],
 )
-category_col_detected = find_column(
-    columns, ["Category", "類別", "分類", "製程類別", "機型", "機型類別"]
+category_col = find_column(
+    columns,
+    ["Category", "類別", "分類", "製程類別", "機型類別"],
 )
-duration_col_detected = find_column(
-    columns, ["標準工期", "工期", "標準工作日", "生產工作日", "需求工時"]
+duration_col = find_column(
+    columns,
+    ["標準工期", "工期", "標準工作日", "生產工作日", "需求工時"],
 )
-quantity_col_detected = find_column(
-    columns, ["數量", "台數", "需求數量", "訂單數量"]
+quantity_col = find_column(
+    columns,
+    ["數量", "台數", "需求數量", "訂單數量"],
 )
 
 st.subheader("欄位對應")
 
-
-def mapping_select(label: str, detected: Optional[str]) -> str:
-    options = ["（不使用）"] + columns
-    index = options.index(detected) if detected in columns else 0
+def mapping_select(label: str, detected: Optional[str], allow_none: bool = True):
+    options = ["（不使用）"] + columns if allow_none else columns
+    if detected in columns:
+        index = options.index(detected)
+    else:
+        index = 0
     return st.selectbox(label, options, index=index)
 
-
 m1, m2, m3 = st.columns(3)
-
 with m1:
-    order_col = mapping_select("製令欄位", order_col_detected)
-    location_col = mapping_select("組立地點欄位", location_col_detected)
-
+    order_col = mapping_select("製令欄位", order_col)
+    location_col = mapping_select("組立地點欄位", location_col)
 with m2:
-    customer_date_col = mapping_select("客戶入庫日欄位", customer_date_col_detected)
-    category_col = mapping_select("Category／機型欄位", category_col_detected)
-
+    customer_date_col = mapping_select("客戶入庫日欄位", customer_date_col)
+    category_col = mapping_select("Category 欄位", category_col)
 with m3:
-    duration_col = mapping_select("標準工期欄位", duration_col_detected)
-    quantity_col = mapping_select("數量欄位", quantity_col_detected)
-
+    duration_col = mapping_select("標準工期欄位", duration_col)
+    quantity_col = mapping_select("數量欄位", quantity_col)
 
 def none_if_unused(value: str) -> Optional[str]:
     return None if value == "（不使用）" else value
-
 
 order_col = none_if_unused(order_col)
 location_col = none_if_unused(location_col)
@@ -347,11 +362,12 @@ if customer_date_col is None:
     st.stop()
 
 
-# =========================================================
-# 資料處理
-# =========================================================
+# -----------------------------
+# Data processing
+# -----------------------------
 result = df.copy()
 
+# Clean key text columns
 if location_col:
     result[location_col] = result[location_col].map(clean_text)
 else:
@@ -359,16 +375,20 @@ else:
     location_col = "組立地點_系統"
 
 if category_col:
+    result["Category_原始值"] = result[category_col].map(clean_text)
     result[category_col] = result[category_col].map(normalize_model)
 else:
+    result["Category_原始值"] = ""
     result["Category_系統"] = "other"
     category_col = "Category_系統"
 
+# Parse date
 result[customer_date_col] = pd.to_datetime(
     result[customer_date_col],
     errors="coerce",
 )
 
+# Location buffer: robust fallback, no KeyError
 result["地點緩衝工作日"] = (
     result[location_col]
     .map(location_buffer)
@@ -376,46 +396,37 @@ result["地點緩衝工作日"] = (
     .astype(int)
 )
 
-if duration_col:
-    result["標準工期_計算"] = safe_numeric(result[duration_col], 0).astype(int)
-    missing_duration = result["標準工期_計算"] <= 0
+# Standard duration
+# 一律依左側 Category 標準工期設定，不再採用 Excel 原有標工欄位。
+result["標準工期_計算"] = (
+    result[category_col]
+    .map(default_category_days)
+    .fillna(default_category_days["other"])
+    .astype(int)
+)
 
-    result.loc[missing_duration, "標準工期_計算"] = (
-        result.loc[missing_duration, category_col]
-        .map(default_category_days)
-        .fillna(default_category_days["other"])
-        .astype(int)
-    )
-else:
-    result["標準工期_計算"] = (
-        result[category_col]
-        .map(default_category_days)
-        .fillna(default_category_days["other"])
-        .astype(int)
-    )
-
+# Optional quantity; currently for display only
 if quantity_col:
     result["數量_計算"] = safe_numeric(result[quantity_col], 1)
 else:
     result["數量_計算"] = 1
 
-# 排程反推公式：
-# 預計入庫日 = 客戶入庫日 - 組立地點緩衝工作日
-# 預計發料日 = 預計入庫日 - Category 標準工期
-# 以上均以工作日計算，排除週六、週日及自訂假日。
-result["預計入庫日"] = result.apply(
-    lambda row: workday_offset(
-        row[customer_date_col],
-        -int(row["地點緩衝工作日"]),
+# Reverse dates
+# 客戶入庫日 - 組立地點緩衝工作日 = 排程入庫日
+# 排程入庫日 - Category 標準工期 = 預計發料日
+result["排程入庫日"] = result.apply(
+    lambda r: workday_offset(
+        r[customer_date_col],
+        -int(r["地點緩衝工作日"]),
         holidays,
     ),
     axis=1,
 )
 
 result["預計發料日"] = result.apply(
-    lambda row: workday_offset(
-        row["預計入庫日"],
-        -int(row["標準工期_計算"]),
+    lambda r: workday_offset(
+        r["排程入庫日"],
+        -int(r["標準工期_計算"]),
         holidays,
     ),
     axis=1,
@@ -426,68 +437,59 @@ result["反推總工作日"] = (
 ).astype(int)
 
 today = pd.Timestamp(date.today())
-
 result["排程狀態"] = np.select(
     [
         result[customer_date_col].isna(),
-        result["預計入庫日"] < today,
+        result["排程入庫日"] < today,
         result["預計發料日"] <= today,
     ],
     [
         "缺少客戶入庫日",
-        "已逾預計入庫日",
+        "已逾排程入庫日",
         "應進行中",
     ],
     default="未開始",
 )
 
 
-
-# 若原始 Excel 已有「發料日／預計發料日」或「入庫日／預計入庫日」欄位，
-# 直接以本次反推結果更新，避免匯出後原欄位仍為空白。
-for target_name in ["發料日", "預計發料日"]:
-    if target_name in result.columns:
-        result[target_name] = result["預計發料日"]
-
-for target_name in ["入庫日", "預計入庫日"]:
-    if target_name in result.columns and target_name != customer_date_col:
-        result[target_name] = result["預計入庫日"]
-
-# =========================================================
-# 看板
-# =========================================================
+# -----------------------------
+# Summary
+# -----------------------------
 st.divider()
 st.info(
-    "反推公式：預計入庫日 ＝ 客戶入庫日 − 組立地點緩衝工作日；預計發料日 ＝ 預計入庫日 − Category 標準工期"
+    "反推公式：客戶入庫日 − 組立地點緩衝工作日 ＝ 排程入庫日；"
+    "排程入庫日 − Category 標準工期 ＝ 預計發料日。"
 )
+st.caption("標準工期完全依左側設定；Excel 原有標工欄位不參與計算。")
 st.subheader("排程摘要")
 
 total_rows = len(result)
 valid_dates = int(result[customer_date_col].notna().sum())
-overdue = int((result["排程狀態"] == "已逾預計入庫日").sum())
+overdue = int((result["排程狀態"] == "已逾排程入庫日").sum())
 in_progress = int((result["排程狀態"] == "應進行中").sum())
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("總筆數", f"{total_rows:,}")
 k2.metric("有效入庫日", f"{valid_dates:,}")
-k3.metric("已逾預計入庫日", f"{overdue:,}")
+k3.metric("已逾排程入庫日", f"{overdue:,}")
 k4.metric("應進行中", f"{in_progress:,}")
 
 display_cols = [
-    col
-    for col in [
+    c
+    for c in [
         order_col,
-        location_col,
+        "Category_原始值",
         category_col,
+        location_col,
         customer_date_col,
         "標準工期_計算",
         "地點緩衝工作日",
         "反推總工作日",
         "預計發料日",
-        "預計入庫日",
+        "排程入庫日",
         "排程狀態",
     ]
-    if col is not None and col in result.columns
+    if c is not None and c in result.columns
 ]
 
 st.dataframe(
@@ -496,31 +498,28 @@ st.dataframe(
     hide_index=True,
 )
 
-st.subheader("組立地點彙整")
 
+# -----------------------------
+# Location summary
+# -----------------------------
+st.subheader("組立地點彙整")
 location_summary = (
     result.groupby(location_col, dropna=False)
     .agg(
         筆數=(location_col, "size"),
         最早發料日=("預計發料日", "min"),
-        最晚入庫日=("預計入庫日", "max"),
-        已逾期=("排程狀態", lambda values: int((values == "已逾預計入庫日").sum())),
+        最晚排程入庫日=("排程入庫日", "max"),
+        已逾期=("排程狀態", lambda s: int((s == "已逾排程入庫日").sum())),
     )
     .reset_index()
 )
-
-st.dataframe(
-    location_summary,
-    use_container_width=True,
-    hide_index=True,
-)
+st.dataframe(location_summary, use_container_width=True, hide_index=True)
 
 
-# =========================================================
-# 匯出
-# =========================================================
+# -----------------------------
+# Download
+# -----------------------------
 output = io.BytesIO()
-
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
     result.to_excel(writer, sheet_name="反推排程結果", index=False)
     location_summary.to_excel(writer, sheet_name="組立地點彙整", index=False)
