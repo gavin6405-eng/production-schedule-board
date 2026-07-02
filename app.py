@@ -497,7 +497,7 @@ st.markdown(
         <div class="hero-row">
             <img class="hero-logo" src="data:image/png;base64,{LOGO_BASE64}">
             <div>
-                <div class="hero-title">超慧科技製造部生產排程智慧看板</div>
+                <div class="hero-title">超慧科技生管排程看板</div>
                 <div class="hero-subtitle">
                     SPT Manufacturing Scheduling Intelligence System
                 </div>
